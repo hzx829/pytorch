@@ -68,7 +68,6 @@ allow_list = [
     ("aten::_foreach_div_.ScalarList", datetime.date(2021, 2, 2)),
     ("aten::_foreach_addcdiv.ScalarList", datetime.date(2021, 2, 2)),
     ("aten::_foreach_addcmul.ScalarList", datetime.date(2021, 2, 2)),
-
 ]
 
 def allow_listed(schema, allow_list):
