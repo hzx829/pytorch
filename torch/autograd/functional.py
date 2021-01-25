@@ -1,5 +1,6 @@
 import torch
 from typing import Tuple, List
+from torch._vmap_internals import vmap
 
 # Utility functions
 
@@ -364,7 +365,37 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False):
     return _tuple_postprocess(outputs, is_outputs_tuple), _tuple_postprocess(jvp, is_outputs_tuple)
 
 
-def jacobian(func, inputs, create_graph=False, strict=False):
+def _construct_standard_basis_for(tensors: Tuple[torch.Tensor, ...], tensor_numels: Tuple[int, ...]) -> Tuple[torch.Tensor, ...]:
+    # This function:
+    # - constructs a N=sum(tensor_numels) standard basis. i.e. an NxN identity matrix.
+    # - Splits the identity matrix into chunks with each chunk size determined by `tensor_numels`.
+    # - Each chunk corresponds to one tensor. The chunk has the same dtype and
+    #   device as the tensor
+    #
+    # For example, with tensor_numels = [1, 2, 1], this function returns:
+    # ( tensor([[1],     tensor([[0, 0],      tensor([[0],
+    #           [0],             [1, 0],              [0],
+    #           [0],             [0, 1],              [0],
+    #           [0]])  ,         [0, 0]])  ,          [1]])  )
+    #
+    # Precondition: tensor_numels == tuple(tensor.numel() for tensor in tensors)
+    # Precondition: tensors always has at least one element.
+    #
+    # See NOTE: [Computing jacobian with vmap and grad for multiple tensors]
+    # for context behind this function. All the pre-conditions are guarded for
+    # in torch.autograd.functional.jacobian.
+    assert len(tensors) == len(tensor_numels)
+    assert len(tensors) > 0
+    total_numel = sum(tensor_numels)
+    diag_start_indices = (0, *torch.tensor(tensor_numels).cumsum(dim=0)[:-1].neg().unbind())
+    chunks = tuple(tensor.new_zeros(total_numel, tensor_numel)
+                   for tensor, tensor_numel in zip(tensors, tensor_numels))
+    for chunk, diag_start_idx in zip(chunks, diag_start_indices):
+        chunk.diagonal(diag_start_idx).fill_(1)
+    return chunks
+
+
+def jacobian(func, inputs, create_graph=False, strict=False, vectorize=False):
     r"""Function that computes the Jacobian of a given function.
 
     Args:
@@ -379,6 +410,13 @@ def jacobian(func, inputs, create_graph=False, strict=False):
             detect that there exists an input such that all the outputs are
             independent of it. If ``False``, we return a Tensor of zeros as the
             jacobian for said inputs, which is the expected mathematical value.
+            Defaults to ``False``.
+        vectorize (bool, optional): This feature is experimental and may have
+            performance cliffs. When computing the jacobian, usually we invoke
+            ``autograd.grad`` once per row of the jacobian. If this flag is
+            ``True``, we use vmap as the backend to vectorize calls to
+            ``autograd.grad`` so we only invoke it once instead of once per row.
+            This should lead to performance improvements in many use cases.
             Defaults to ``False``.
 
     Returns:
@@ -429,6 +467,85 @@ def jacobian(func, inputs, create_graph=False, strict=False):
     _check_requires_grad(outputs, "outputs", strict=strict)
 
     jacobian: Tuple[torch.Tensor, ...] = tuple()
+
+    if vectorize:
+        if strict:
+            raise RuntimeError('torch.autograd.functional.jacobian: `strict=True` '
+                               'and `vectorized=True` are not supported together. '
+                               'Please either set `strict=False` or '
+                               '`vectorize=False`.')
+        # NOTE: [Computing jacobian with vmap and grad for multiple outputs]
+        #
+        # Let's consider f(x) = (x**2, x.sum()) and let x = torch.randn(3).
+        # It turns out we can compute the jacobian of this function with a single
+        # call to autograd.grad by using vmap over the correct grad_outputs.
+        #
+        # Firstly, one way to compute the jacobian is to stack x**2 and x.sum()
+        # into a 4D vector. E.g., use g(x) = torch.stack([x**2, x.sum()])
+        #
+        # To get the first row of the jacobian, we call
+        # >>> autograd.grad(g(x), x, grad_outputs=torch.tensor([1, 0, 0, 0]))
+        # To get the 2nd row of the jacobian, we call
+        # >>> autograd.grad(g(x), x, grad_outputs=torch.tensor([0, 1, 0, 0]))
+        # and so on.
+        #
+        # Using vmap, we can vectorize all 4 of these computations into one by
+        # passing the standard basis for R^4 as the grad_output.
+        # vmap(partial(autograd.grad, g(x), x))(torch.eye(4)).
+        #
+        # Now, how do we compute the jacobian *without stacking the output*?
+        # We can just split the standard basis across the outputs. So to
+        # compute the jacobian of f(x), we'd use
+        # >>> autograd.grad(f(x), x, grad_outputs=_construct_standard_basis_for(...))
+        # The grad_outputs looks like the following:
+        # ( torch.tensor([[1, 0, 0],
+        #                 [0, 1, 0],
+        #                 [0, 0, 1],
+        #                 [0, 0, 0]]),
+        #   torch.tensor([[0],
+        #                 [0],
+        #                 [0],
+        #                 [1]]) )
+        #
+        # But we're not done yet!
+        # >>> vmap(partial(autograd.grad(f(x), x, grad_outputs=...)))
+        # returns a Tensor of shape [4, 3]. We have to remember to split the
+        # jacobian of shape [4, 3] into two:
+        # - one of shape [3, 3] for the first output
+        # - one of shape [   3] for the second output
+
+        # Step 1: Construct grad_outputs by splitting the standard basis
+        output_numels = tuple(output.numel() for output in outputs)
+        grad_outputs = _construct_standard_basis_for(outputs, output_numels)
+        flat_outputs = tuple(output.reshape(-1) for output in outputs)
+
+        # Step 2: Call vmap + autograd.grad
+        def vjp(grad_output):
+            vj = list(_autograd_grad(flat_outputs, inputs, grad_output, create_graph=create_graph))
+            for el_idx, vj_el in enumerate(vj):
+                if vj_el is not None:
+                    continue
+                vj[el_idx] = torch.zeros_like(inputs[el_idx])
+            return tuple(vj)
+
+        jacobians_of_flat_output = vmap(vjp)(grad_outputs)
+
+        # Step 3: The returned jacobian is one big tensor per input. In this step,
+        # we split each Tensor by output.
+        jacobian = tuple(
+            tuple(jac_out.view(output.shape + inp.shape)
+                  for jac_out, output in zip(jac.split(output_numels, dim=0), outputs))
+            for jac, inp in zip(jacobians_of_flat_output, inputs))
+
+        # Step 4: Right now, `jacobian` is a Tuple[Tuple[...]].
+        # The outer tuple corresponds to the number of inputs,
+        # the inner tuple corresponds to the number of outputs.
+        # We need to exchange the order of these before returning.
+        jacobian = tuple(zip(*jacobian))
+
+        jacobian = _grad_postprocess(jacobian, create_graph)
+        return _tuple_postprocess(jacobian, (is_outputs_tuple, is_inputs_tuple))
+
     for i, out in enumerate(outputs):
 
         # mypy complains that expression and variable have different types due to the empty list
@@ -461,7 +578,7 @@ def jacobian(func, inputs, create_graph=False, strict=False):
     return _tuple_postprocess(jacobian, (is_outputs_tuple, is_inputs_tuple))
 
 
-def hessian(func, inputs, create_graph=False, strict=False):
+def hessian(func, inputs, create_graph=False, strict=False, vectorize=False):
     r"""Function that computes the Hessian of a given scalar function.
 
     Args:
@@ -476,6 +593,14 @@ def hessian(func, inputs, create_graph=False, strict=False):
             such that all the outputs are independent of it. If ``False``, we return a Tensor of zeros as the
             hessian for said inputs, which is the expected mathematical value.
             Defaults to ``False``.
+        vectorize (bool, optional): This feature is experimental and may have
+            performance cliffs. When computing the hessian, usually we invoke
+            ``autograd.grad`` once per row of the hessian. If this flag is
+            ``True``, we use vmap as the backend to vectorize calls to
+            ``autograd.grad`` so we only invoke it once instead of once per row.
+            This should lead to performance improvements in many use cases.
+            Defaults to ``False``.
+
 
     Returns:
         Hessian (Tensor or a tuple of tuple of Tensors): if there is a single input,
@@ -545,7 +670,7 @@ def hessian(func, inputs, create_graph=False, strict=False):
         _check_requires_grad(jac, "jacobian", strict=strict)
         return jac
 
-    res = jacobian(jac_func, inputs, create_graph=create_graph, strict=strict)
+    res = jacobian(jac_func, inputs, create_graph=create_graph, strict=strict, vectorize=vectorize)
     return _tuple_postprocess(res, (is_inputs_tuple, is_inputs_tuple))
 
 
